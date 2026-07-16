@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Review = {
   summary: string;
@@ -136,6 +136,26 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
+  const [streamingText, setStreamingText] = useState("");
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const finalizingStartedAtRef = useRef<number | null>(null);
+  const MIN_FINALIZING_MS = 700;
+
+  useEffect(() => {
+    if (loading) {
+      setElapsedSeconds(0);
+      timerRef.current = setInterval(() => {
+        setElapsedSeconds((prev) => prev + 1);
+      }, 1000);
+    } else if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [loading]);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     // Bug 1 fixed: prevent browser from reloading the page on form submit
@@ -143,6 +163,8 @@ export default function Home() {
     setError(null);
     setReview(null);
     setMeta(null);
+    setStreamingText("");
+    finalizingStartedAtRef.current = null;
 
     try {
       setLoading(true);
@@ -152,21 +174,106 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
       });
 
-      const data = await response.json();
-
-      // Bug 2 fixed: check response.ok before trusting the shape of data
-      if (!response.ok) {
-        setError(data.details ?? data.error ?? "Something went wrong.");
+      if(!response.ok){
+        const errorPayload = await response.json();
+        setError(errorPayload.details ?? errorPayload.error ?? "Something went wrong");
         return;
       }
 
-      setReview(data.review);
-      setMeta(data.meta);
-    } catch (err) {
-      // Bug 3 fixed: display the error; Bug 5 fixed: cast unknown error correctly
-      setError((err as Error).message ?? "Network error. Please try again.");
-    } finally {
-      setLoading(false);
+      const reader = response.body?.getReader();
+      if(!reader){
+        setError("Failed to get reader");
+        return;
+      }
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedText = "";
+      let currentEventName = "message";
+      let receivedMetaData: Meta | null = null;
+      const fetchStartedAt = Date.now();
+      let readCount = 0;
+      while(true){
+
+        const { done, value } = await reader.read();
+        if(done){
+          console.log(`[client] stream done at +${Date.now() - fetchStartedAt}ms, total reads=${readCount}`);
+          break;
+        }
+        readCount += 1;
+        console.log(`[client] read #${readCount} at +${Date.now() - fetchStartedAt}ms, bytes=${value?.length ?? 0}`);
+
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() ?? "";
+
+
+          for(const rawEvent of events){
+          if(!rawEvent.trim()){
+            continue;
+          }
+          const lines = rawEvent.split('\n');
+          currentEventName = "message";
+          let dataPayload = "";
+          for(const line of lines){
+            if(line.startsWith("event: ")){
+              currentEventName = line.slice("event: ".length).trim();
+            } else if (line.startsWith("data: ")){
+              dataPayload += line.slice("data: ".length);
+            }
+          }
+
+          if(dataPayload === "[DONE]") continue;
+
+          if(currentEventName === "meta"){
+            try{
+              receivedMetaData = JSON.parse(dataPayload) as Meta;
+              setMeta(receivedMetaData);
+            } catch (error) {
+              console.error("Failed to parse meta data:", error);
+            }
+          }
+          else if (currentEventName === "error"){
+            try{
+              const errorData = JSON.parse(dataPayload)
+              setError(errorData.details ?? errorData.error ?? "Something went wrong");
+            } catch (error) {
+              console.error("Failed to parse error data:", error);
+              setError("Failed to parse error data");
+            }
+          } else {
+            if (finalizingStartedAtRef.current === null) {
+              finalizingStartedAtRef.current = Date.now();
+            }
+            const cleanText = dataPayload.replace(/\\n/g, '\n');
+            accumulatedText += cleanText;
+            setStreamingText(accumulatedText);
+          }
+        }
+      }
+
+      // Minimum loading duration: avoid a "Finalizing..." flash that's too
+      // fast to perceive when Gemini streams its output in a fast burst.
+      if (finalizingStartedAtRef.current !== null) {
+        const finalizingElapsedMs = Date.now() - finalizingStartedAtRef.current;
+        if (finalizingElapsedMs < MIN_FINALIZING_MS) {
+          await new Promise((resolve) => setTimeout(resolve, MIN_FINALIZING_MS - finalizingElapsedMs));
+        }
+      }
+
+      try{
+        const parsed = JSON.parse(accumulatedText) as Review;
+        setReview(parsed);
+        setStreamingText("");
+      } catch (error) {
+        console.error("Failed to parse review data:", error);
+        setError("Failed to parse review data");
+      } finally {
+        setLoading(false);
+      }
+    } catch (error) {
+      console.error("Failed to review resume:", error);
+      setError("Failed to review resume");
     }
   };
 
@@ -276,6 +383,37 @@ export default function Home() {
             )}
           </button>
         </form>
+
+        {loading && (
+          <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-xl">
+            <div className="flex items-center gap-3">
+              <div className="relative h-8 w-8 shrink-0">
+                <div className="absolute inset-0 rounded-full border-2 border-slate-700" />
+                <div className="absolute inset-0 rounded-full border-2 border-t-indigo-400 border-r-indigo-400 border-b-transparent border-l-transparent animate-spin" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-sm font-semibold text-slate-200">
+                  {streamingText ? "Finalizing your review…" : "Analyzing your resume…"}
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {streamingText
+                    ? "Structuring feedback into strengths, gaps, and suggestions."
+                    : `Gemini is reasoning through your experience and target role — this can take 15-20s (${elapsedSeconds}s elapsed).`}
+                </p>
+              </div>
+            </div>
+
+            {/* Indeterminate progress bar */}
+            <div className="mt-4 h-1 w-full rounded-full bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full bg-indigo-500 rounded-full transition-all duration-1000 ${
+                  streamingText ? "w-full" : ""
+                }`}
+                style={!streamingText ? { width: `${Math.min(elapsedSeconds * 4, 92)}%` } : undefined}
+              />
+            </div>
+          </div>
+        )}
 
         {/* Results */}
         {/* Bug 6 fixed: gate on both review AND meta being non-null */}

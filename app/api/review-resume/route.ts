@@ -1,13 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({});
+const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY});
 const systemPrompt = (role: string, yearsOfExperience: number) => `You are a senior ${role} hiring manager with 10+ years of experience 
 reviewing technical resumes. You are strict, honest, and specific in 
 your feedback. You do not sugarcoat weaknesses and you do not inflate 
 strengths.
 
 ## Task
-Review the candidate's resume for a ${role}position. The candidate 
+Review the candidate's resume for a ${role} position. The candidate 
 has ${yearsOfExperience} years of experience. Calibrate all feedback 
 to this experience level — a 1-year candidate is judged differently 
 than a 10-year candidate.
@@ -29,10 +29,10 @@ Your entire response must be valid JSON parseable by JSON.parse().
 ## Field Rules
 - summary: exactly 1-2 sentences, direct and specific.
 - strengths: 3-5 items. Each must reference something literally in the resume.
-- gaps: 3-5 items. Skills/experience missing for a ${role}at 
-  ${yearsOfExperience}-year experience level.
+- gaps: 3-5 items. Skills/experience missing for a ${role} at 
+  ${yearsOfExperience} - year experience level.
 - missingKeywords: 3-8 items. ATS-relevant keywords for ${role}
-  positions that are absent from the resume.
+   positions that are absent from the resume.
 - suggestions: 3-5 items. Concrete, actionable improvements.
 - overallScore: integer from 1 to 10. Be honest — most resumes 
   score 5-7. Reserve 9-10 for exceptional candidates.
@@ -68,7 +68,7 @@ export async function POST(request: Request) {
         return Response.json({ error: "Invalid Input", details: "'role' is required and must be a string" }, { status: 400 });
       }
 
-    const acceptedRoles = ['Backend Engineer', 'Frontend Engineer', 'Full Stack Engineer', 'AI Engineer', 'Data Engineer']
+    const acceptedRoles = ['Backend Engineer', 'Frontend Engineer', 'Full Stack Engineer', 'AI Engineer']
     if(resume.length < 200 || resume.length > 15000) {
         return Response.json({error: "Invalid Input" , details: 'Resume must be between 200 and 15000 characters' }, { status: 400 });
     }
@@ -78,8 +78,8 @@ export async function POST(request: Request) {
     if(!acceptedRoles.includes(role)) {
         return Response.json({error: "Invalid Input" , details: `${role} must be one of the following: ${acceptedRoles.join(', ')}` }, { status: 400 });
     }
-    try {
-        const result = await ai.models.generateContent({
+    try{
+          const responseStream = await ai.models.generateContentStream({
             model: 'gemini-3.5-flash',
 
             contents: `Review the following resume: ${resume} for the role of ${role} with ${yearsOfExperience} years of experience.`,
@@ -89,19 +89,62 @@ export async function POST(request: Request) {
                 }, 
                 systemInstruction: systemPrompt(role, yearsOfExperience),
             }
-        })
-        console.log(result.usageMetadata);
-        try{
-            const parsedRespone = JSON.parse(result.text || '{}');
-            return Response.json({review: parsedRespone, meta: {model: 'gemini-3.5-flash', tokensUsed: result.usageMetadata?.totalTokenCount ?? 0, responseId: result.responseId ?? 'unknown' }}, { status: 200 });
-        }
-        catch(error){
-            console.error(error);
-            return Response.json({error: "Invalid Response" , details: 'Response is not a valid JSON' }, { status: 500 });
-        }
-    } 
-    catch(error){
-        console.error(error);
-        return Response.json({error: "Internal Server Error" , details: 'Failed to review resume' }, { status: 500 });
-    }
+        });
+
+        const encoder = new TextEncoder();
+
+        const streamStartedAt = Date.now();
+        let chunkCount = 0;
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            let finalUsageMetadata: unknown = null;
+            let finalResponseId: string | null = null;
+            try{
+              for await (const chunk of responseStream) {
+                if(chunk.text){
+                  chunkCount += 1;
+                  const elapsedMs = Date.now() - streamStartedAt;
+                  console.log(`[stream] chunk #${chunkCount} at +${elapsedMs}ms, length=${chunk.text.length}`);
+                  const safeText = chunk.text.replace(/\n/g, '\\n');
+                  controller.enqueue(encoder.encode(`data: ${safeText}\n\n`));
+                }
+                if(chunk.usageMetadata){
+                  finalUsageMetadata = chunk.usageMetadata;
+                }
+                if(chunk.responseId){
+                  finalResponseId = chunk.responseId;
+                }
+              }
+              console.log(`[stream] done. total chunks=${chunkCount}, total time=${Date.now() - streamStartedAt}ms`);
+
+              const metaPayload = {
+                model: 'gemini-3.5-flash',
+                tokensUsed: (finalUsageMetadata as { totalTokenCount?: number })?.totalTokenCount ?? 0,
+                responseId: finalResponseId ?? 'unknown',
+              };
+
+              controller.enqueue(encoder.encode(`event: meta\ndata: ${JSON.stringify(metaPayload)}\n\n`));
+              controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+            }
+            catch(error){
+              const errorPayload = {
+                error: "Stream failed",
+                details: 'LLM Stream interupted',
+              };
+              controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify(errorPayload)}\n\n`));
+            }finally {
+              controller.close();
+            }
+          }
+        });
+        return new Response(stream, { headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        }}); }
+  catch (error) {
+    console.error(error);
+    return Response.json({ error: "Internal Server Error", details: "Failed to review resume" }, { status: 500 });
+  }
 }
