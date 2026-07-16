@@ -1,4 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
+import { logRequest } from "@/lib/logger";
+
+const MODEL = "gemini-3.5-flash";
 
 const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY});
 const systemPrompt = (role: string, yearsOfExperience: number) => `You are a senior ${role} hiring manager with 10+ years of experience 
@@ -52,35 +55,63 @@ Return only the JSON object. No preamble, no markdown, no code fences.`;
 
 
 export async function POST(request: Request) {
+    const requestStartedAt = Date.now();
     let resume: string, yearsOfExperience: number, role: string;
     try {
         ({ resume, yearsOfExperience, role } = await request.json() as {resume: string, yearsOfExperience: number, role: string});
     } catch {
+        logRequest({
+          status: "error",
+          route: "review-resume",
+          latencyMs: Date.now() - requestStartedAt,
+          errorType: "invalid_json",
+          errorMessage: "Request body is not valid JSON",
+        });
         return Response.json({ error: "Invalid Input", details: "Request body is not valid JSON. Make sure the resume text is properly encoded." }, { status: 400 });
     }
+
+    const logValidationError = (errorType: string, errorMessage: string) => {
+      logRequest({
+        status: "error",
+        route: "review-resume",
+        role: typeof role === "string" ? role : undefined,
+        yearsOfExperience: typeof yearsOfExperience === "number" ? yearsOfExperience : undefined,
+        resumeLength: typeof resume === "string" ? resume.length : undefined,
+        latencyMs: Date.now() - requestStartedAt,
+        errorType,
+        errorMessage,
+      });
+    };
+
     if (typeof resume !== 'string') {
+        logValidationError("missing_field", "'resume' is required and must be a string");
         return Response.json({ error: "Invalid Input", details: "'resume' is required and must be a string" }, { status: 400 });
       }
       if (typeof yearsOfExperience !== 'number') {
+        logValidationError("missing_field", "'yearsOfExperience' is required and must be a number");
         return Response.json({ error: "Invalid Input", details: "'yearsOfExperience' is required and must be a number" }, { status: 400 });
       }
       if (typeof role !== 'string') {
+        logValidationError("missing_field", "'role' is required and must be a string");
         return Response.json({ error: "Invalid Input", details: "'role' is required and must be a string" }, { status: 400 });
       }
 
     const acceptedRoles = ['Backend Engineer', 'Frontend Engineer', 'Full Stack Engineer', 'AI Engineer']
     if(resume.length < 200 || resume.length > 15000) {
+        logValidationError("invalid_value", "Resume must be between 200 and 15000 characters");
         return Response.json({error: "Invalid Input" , details: 'Resume must be between 200 and 15000 characters' }, { status: 400 });
     }
     if(yearsOfExperience < 0 || yearsOfExperience > 50) {
+        logValidationError("invalid_value", "Year of experience must be between 0 and 50");
         return Response.json({error: "Invalid Input" , details: 'Year of experience must be between 0 and 50' }, { status: 400 });
     }
     if(!acceptedRoles.includes(role)) {
+        logValidationError("invalid_value", `${role} must be one of the following: ${acceptedRoles.join(', ')}`);
         return Response.json({error: "Invalid Input" , details: `${role} must be one of the following: ${acceptedRoles.join(', ')}` }, { status: 400 });
     }
     try{
           const responseStream = await ai.models.generateContentStream({
-            model: 'gemini-3.5-flash',
+            model: MODEL,
 
             contents: `Review the following resume: ${resume} for the role of ${role} with ${yearsOfExperience} years of experience.`,
             config: {
@@ -93,19 +124,18 @@ export async function POST(request: Request) {
 
         const encoder = new TextEncoder();
 
-        const streamStartedAt = Date.now();
-        let chunkCount = 0;
-
         const stream = new ReadableStream({
           async start(controller) {
-            let finalUsageMetadata: unknown = null;
+            let finalUsageMetadata: {
+              promptTokenCount?: number;
+              thoughtsTokenCount?: number;
+              candidatesTokenCount?: number;
+              totalTokenCount?: number;
+            } | null = null;
             let finalResponseId: string | null = null;
             try{
               for await (const chunk of responseStream) {
                 if(chunk.text){
-                  chunkCount += 1;
-                  const elapsedMs = Date.now() - streamStartedAt;
-                  console.log(`[stream] chunk #${chunkCount} at +${elapsedMs}ms, length=${chunk.text.length}`);
                   const safeText = chunk.text.replace(/\n/g, '\\n');
                   controller.enqueue(encoder.encode(`data: ${safeText}\n\n`));
                 }
@@ -116,16 +146,30 @@ export async function POST(request: Request) {
                   finalResponseId = chunk.responseId;
                 }
               }
-              console.log(`[stream] done. total chunks=${chunkCount}, total time=${Date.now() - streamStartedAt}ms`);
 
               const metaPayload = {
-                model: 'gemini-3.5-flash',
-                tokensUsed: (finalUsageMetadata as { totalTokenCount?: number })?.totalTokenCount ?? 0,
+                model: MODEL,
+                tokensUsed: finalUsageMetadata?.totalTokenCount ?? 0,
                 responseId: finalResponseId ?? 'unknown',
               };
 
               controller.enqueue(encoder.encode(`event: meta\ndata: ${JSON.stringify(metaPayload)}\n\n`));
               controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+
+              logRequest({
+                status: "success",
+                route: "review-resume",
+                role,
+                yearsOfExperience,
+                resumeLength: resume.length,
+                model: MODEL,
+                promptTokens: finalUsageMetadata?.promptTokenCount ?? 0,
+                thinkingTokens: finalUsageMetadata?.thoughtsTokenCount ?? 0,
+                outputTokens: finalUsageMetadata?.candidatesTokenCount ?? 0,
+                totalTokens: finalUsageMetadata?.totalTokenCount ?? 0,
+                latencyMs: Date.now() - requestStartedAt,
+                responseId: finalResponseId ?? 'unknown',
+              });
             }
             catch(error){
               const errorPayload = {
@@ -133,6 +177,17 @@ export async function POST(request: Request) {
                 details: 'LLM Stream interupted',
               };
               controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify(errorPayload)}\n\n`));
+
+              logRequest({
+                status: "error",
+                route: "review-resume",
+                role,
+                yearsOfExperience,
+                resumeLength: resume.length,
+                latencyMs: Date.now() - requestStartedAt,
+                errorType: "stream_interrupted",
+                errorMessage: error instanceof Error ? error.message : "Unknown stream error",
+              });
             }finally {
               controller.close();
             }
@@ -144,7 +199,16 @@ export async function POST(request: Request) {
           'Connection': 'keep-alive',
         }}); }
   catch (error) {
-    console.error(error);
+    logRequest({
+      status: "error",
+      route: "review-resume",
+      role,
+      yearsOfExperience,
+      resumeLength: resume.length,
+      latencyMs: Date.now() - requestStartedAt,
+      errorType: "llm_call_failed",
+      errorMessage: error instanceof Error ? error.message : "Unknown error",
+    });
     return Response.json({ error: "Internal Server Error", details: "Failed to review resume" }, { status: 500 });
   }
 }
